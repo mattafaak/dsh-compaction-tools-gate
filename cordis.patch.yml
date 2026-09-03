@@ -1,0 +1,12 @@
+# dsh-compaction-tools-gate -- mount on the llm/stream waterfall.
+#
+# `global: true` matters: the runtime filters listeners by context, and the
+# compaction plugin runs in its own. Without it the listener never sees the
+# summarization call.
+#
+# Config is optional; the defaults do the one thing the plugin exists for
+# (drop tool schemas from compaction calls). See README for `reroute` and
+# `toolResultMaxChars`.
+- insert:
+    - id: compaction-tools-gate
+      name: 'dsh-compaction-tools-gate'
