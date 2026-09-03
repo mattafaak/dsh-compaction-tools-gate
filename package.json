@@ -1,6 +1,6 @@
 {
   "name": "dsh-compaction-tools-gate",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Stop DeepSeek Harness compaction losing its summary: drop the tool schemas from the summarization call, because GenerateOptions has no toolChoice to say \"don't call a tool\".",
   "type": "module",
   "main": "index.js",
@@ -8,7 +8,12 @@
     ".": "./index.js",
     "./package.json": "./package.json"
   },
-  "files": ["index.js", "cordis.patch.yml", "README.md", "LICENSE"],
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -17,7 +22,14 @@
   "scripts": {
     "test": "node test/gate.test.mjs"
   },
-  "keywords": ["dsh", "deepseek-harness", "cordis", "compaction", "llm", "plugin"],
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "compaction",
+    "llm",
+    "plugin"
+  ],
   "author": "mattafaak",
   "license": "MIT",
   "repository": {
@@ -28,5 +40,7 @@
     "url": "https://github.com/mattafaak/dsh-compaction-tools-gate/issues"
   },
   "homepage": "https://github.com/mattafaak/dsh-compaction-tools-gate#readme",
-  "engines": { "node": ">=20" }
+  "engines": {
+    "node": ">=20"
+  }
 }

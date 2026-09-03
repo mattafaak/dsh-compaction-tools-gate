@@ -128,7 +128,10 @@ npm test        # 36 checks, no network, no model
 ```
 
 Verified against dsh **0.1.2-alpha.5** and **0.1.2-rc.1**; the defect is
-present and unchanged in both.
+present and unchanged in both. An offline end-to-end run (stub provider, a
+64k window, automatic compaction fired twice) asserts the summarization
+request carries no tool schemas while main-loop requests keep all 33 of
+theirs, and that the resulting `compaction/summary` holds text.
 
 ## License
 

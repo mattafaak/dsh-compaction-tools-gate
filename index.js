@@ -63,7 +63,11 @@
  */
 
 /** Plugin name shown by plugin-listing surfaces. */
-export const name = 'llm-compaction-shim'
+// The package identity, so a user sees ONE name: the bundle patch mounts
+// `id: compaction-tools-gate` and cordis logs the same string. Before 0.1.1
+// this said 'llm-compaction-shim' -- the local file's original name -- so the
+// config said one thing and the log another.
+export const name = 'compaction-tools-gate'
 
 /** The waterfall is dispatched by the llm runtime; make sure it exists first. */
 export const inject = ['llm']
