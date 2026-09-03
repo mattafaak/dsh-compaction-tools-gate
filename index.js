@@ -156,10 +156,33 @@ export function trimToolResults (messages, max) {
 export function apply (ctx, config = {}) {
   const quiet = config.quiet === true
   const reroute = config.reroute && typeof config.reroute === 'object' ? config.reroute : {}
-  // 0 disables the trim. 2000 is Yunado's tested default (#3465); it is not
-  // the default HERE, because a config that trims by default would change what
-  // summaries are built from without anyone choosing it.
-  const maxChars = Number.isFinite(config.toolResultMaxChars) ? config.toolResultMaxChars : 0
+  // 2000 is Yunado's tested default (#3465); it is not the default HERE,
+  // because a config that trims by default would change what summaries are
+  // built from without anyone choosing it.
+  // 0 disables. A YAML-QUOTED "2000" is a STRING, Number.isFinite says false,
+  // and the trim was silently off with no signal anywhere -- so say so instead
+  // of falling back quietly. (smoke-test asserts the live value is 2000.)
+  let maxChars = 0
+  if (Number.isFinite(config.toolResultMaxChars)) {
+    maxChars = config.toolResultMaxChars
+  } else if (config.toolResultMaxChars !== undefined) {
+    const coerced = Number(config.toolResultMaxChars)
+    console.error(`[llm-compaction-shim] toolResultMaxChars is ${JSON.stringify(config.toolResultMaxChars)}, ` +
+      `not a number -- the tool-result trim is OFF. Unquote it in cordis.patch.yml` +
+      (Number.isFinite(coerced) ? ` (you probably meant ${coerced}).` : '.'))
+  }
+
+  // A reroute is a map, so a CYCLE is expressible: {a/x: y, a/y: x} would
+  // recurse through this.stream() until the stack gave out. Nothing rejects it
+  // upstream, and the failure would look like a hung compaction.
+  for (const [from, to] of Object.entries(reroute)) {
+    const [prov] = from.split('/')
+    if (reroute[`${prov}/${to}`] !== undefined) {
+      console.error(`[llm-compaction-shim] reroute cycle: ${from} -> ${to} -> ` +
+        `${reroute[`${prov}/${to}`]}; dropping ${from} rather than recursing`)
+      delete reroute[from]
+    }
+  }
   const log = (msg) => { if (!quiet) console.error(`[llm-compaction-shim] ${msg}`) }
   ctx.on('llm/stream', function (options, next) {
     const v = classify(options, reroute, maxChars)

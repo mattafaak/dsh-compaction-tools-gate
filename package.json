@@ -1,6 +1,6 @@
 {
   "name": "dsh-compaction-tools-gate",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Stop DeepSeek Harness compaction losing its summary: drop the tool schemas from the summarization call, because GenerateOptions has no toolChoice to say \"don't call a tool\".",
   "type": "module",
   "main": "index.js",

@@ -110,4 +110,25 @@ let n3 = 0; L3["llm/stream"].call({}, call, () => { n3++ })
 check(n3 === 1 && call.messages[1].content.length < 2200 && call.messages[2].content.length === 6000,
       "listener: trims in place, leaves assistant text alone")
 
+
+// --- config hazards ---------------------------------------------------------
+// Two shapes a user can write in cordis.patch.yml that fail SILENTLY.
+{
+  const errs = []; const realErr = console.error
+  console.error = (m) => errs.push(String(m))
+  apply({ on () {} }, { toolResultMaxChars: '2000', quiet: true })
+  console.error = realErr
+  check(errs.some((e) => e.includes('not a number') && e.includes('trim is OFF')),
+        'a YAML-quoted toolResultMaxChars says so instead of disabling the trim quietly')
+}
+{
+  const errs = []; const realErr = console.error
+  console.error = (m) => errs.push(String(m))
+  const cycle = { 'p/a': 'b', 'p/b': 'a' }
+  apply({ on () {} }, { reroute: cycle, quiet: true })
+  console.error = realErr
+  check(errs.some((e) => e.includes('reroute cycle')), 'a reroute cycle is reported, not recursed into')
+  check(Object.keys(cycle).length === 1, 'and one leg is dropped so the survivor still works')
+}
+
 console.log(failed ? `${failed} FAILED` : 'ALL PASSED'); process.exit(failed ? 1 : 0)
