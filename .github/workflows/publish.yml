@@ -1,0 +1,55 @@
+# Publish to npm via TRUSTED PUBLISHING (OIDC). No npm token anywhere -- not in
+# repository secrets, not on the maintainer's machine. npm mints a short-lived,
+# cryptographically-signed token per publish from GitHub's OIDC claim, which is
+# why `id-token: write` below is not optional and why there is no NODE_AUTH_TOKEN.
+#
+# One-time setup on npmjs.com, under this package's Settings -> Trusted Publisher:
+#   Organization or user : mattafaak
+#   Repository           : dsh-compaction-tools-gate
+#   Workflow filename    : publish.yml
+#   Allowed actions      : npm publish
+#
+# Requires npm >= 11.5.1 and node >= 22.14.0; setup-node with a current node
+# satisfies both. Release = push a tag:  git tag v0.1.1 && git push --tags
+name: publish
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write   # REQUIRED: this is what OIDC signs with
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false
+
+      # Zero dependencies, so there is nothing to install -- but run the tests,
+      # because publishing a package whose tests were never executed in CI is
+      # how a broken release ships.
+      - name: test
+        run: npm test
+
+      # Refuse to publish a version that does not match the tag. Without this,
+      # `git tag v0.2.0` on a package.json still saying 0.1.0 publishes 0.1.0
+      # again (or fails opaquely) -- the tag and the artifact must agree.
+      - name: tag matches package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "tag $GITHUB_REF_NAME implies version $tag but package.json says $pkg" >&2
+            exit 1
+          fi
+          echo "tag and package.json agree on $pkg"
+
+      - name: publish
+        run: npm publish --access public
