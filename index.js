@@ -57,6 +57,26 @@
  * so the model knows it is reading a fragment, the assistant's own text is
  * never touched, and `toolResultMaxChars: 0` disables it.
  *
+ * FOURTH JOB (2026-09-05): KEEP THE CACHE PREFIX. Dropping the schemas made
+ * every summarize call a cold prefill -- 10 of 10 on 2026-09-04 reused ZERO
+ * cache, 105-134 s each -- because the schemas sit in Qwen's system region.
+ * llama.cpp keeps the tools in the rendered template under `tool_choice: none`
+ * and only skips the grammar (common/chat.cpp `include_grammar`, verified at
+ * b10797 and b10816), and llama-swap v253's `filters.setParamsByID` pins that
+ * parameter onto an ALIAS of the same process. So with `keepToolsVia:
+ * {"alder/qwen3.8-27b-vl": "qwen3.8-27b-vl-compact-notools"}` a compaction
+ * call goes to the alias WITH its tools and WITHOUT the trim (the trim
+ * rewrites the middle and would kill the prefix). Measured by effect before
+ * shipping: the alias request reused 656 of 660 tokens from the base lane's
+ * request, and returned `finish: stop` where the base lane returned a tool
+ * call. THE PRICE: under tool_choice none the model can still write the tool
+ * call AS TEXT (`<tool_call> <function=...`) -- it did, under a tool-forcing
+ * prompt -- and a summary that is a tool call is a silent data loss. So the
+ * alias reply is BUFFERED (compaction is not interactive), inspected at its
+ * end, and a tool-shaped, empty or errored reply is replaced by the certain
+ * cold path (tools dropped, results trimmed), counted and logged. The
+ * thinking lane's reroute keeps the cold path: a lane swap is cold anyway.
+ *
  * NO DEPENDENCIES, loaded by absolute file:// URL from a cordis.patch.yml
  * row, for the same reason as dsh-web-search-searxng: nothing here may
  * require a pnpm install, because any pnpm run restores the web-auth prompt.
@@ -89,14 +109,66 @@ export const COMPACTION_PURPOSE = 'compaction'
  * @returns `{ action: 'pass'|'mutate'|'redispatch', dropTools, model }`;
  *   pure, so the test can pin it.
  */
-export function classify (options, reroute = {}, toolResultMaxChars = 0) {
+export function classify (options, reroute = {}, toolResultMaxChars = 0, keepToolsVia = {}) {
   if (!options || options.purpose !== COMPACTION_PURPOSE) return { action: 'pass' }
   const dropTools = Array.isArray(options.tools) && options.tools.length > 0
   const target = reroute[`${options.provider}/${options.model}`]
   const model = typeof target === 'string' && target.length > 0 && target !== options.model ? target : undefined
+  // KEEP: this lane has a tool_choice-none alias, the call carries tools, and
+  // it is not being rerouted to another process (that is cold regardless).
+  const via = keepToolsVia[`${options.provider}/${options.model}`]
+  if (dropTools && model === undefined && typeof via === 'string' && via.length > 0 && via !== options.model) {
+    return { action: 'keep', via }
+  }
   const trim = toolResultMaxChars > 0 && countOversized(options.messages, toolResultMaxChars) > 0
   if (!dropTools && model === undefined && !trim) return { action: 'pass' }
   return { action: Object.isFrozen(options) ? 'redispatch' : 'mutate', dropTools, model, trim }
+}
+
+/** Text that is a tool call in disguise: what a lane writes under tool_choice none when it wanted to call. */
+export function looksLikeToolCall (text) {
+  const head = (text || '').trimStart().slice(0, 400)
+  return /^(<tool_call>|<function=|\{\s*"(name|tool_calls?)"\s*:)/i.test(head) || /<tool_call>/i.test(head)
+}
+
+/** Fallbacks taken so far, so a test or a reader can count them. */
+export const stats = { keepCalls: 0, fallbacks: 0 }
+
+/**
+ * Consume the alias reply, then either replay it or replace it with the cold
+ * path. `inner` is the alias stream (async iterable of chunks), `fallback()`
+ * returns the cold-path stream. Pure with respect to everything but `stats`.
+ */
+export async function * guardedSummary (inner, fallback, log = () => {}) {
+  const buf = []
+  let text = ''
+  let toolCall = false
+  let failed = null
+  let aborted = false
+  try {
+    for await (const chunk of inner) {
+      buf.push(chunk)
+      if (!chunk || typeof chunk !== 'object') continue
+      if (chunk.type === 'text-delta') text += chunk.text ?? ''
+      else if (chunk.type === 'tool-call-delta') toolCall = true
+      else if (chunk.type === 'finish') {
+        const kind = chunk.reason?.kind
+        if (kind === 'error') failed = chunk.reason?.failure?.message ?? chunk.reason?.failure?.code ?? 'error'
+        else if (kind === 'aborted') aborted = true
+      }
+    }
+  } catch (err) {
+    failed = err?.message ?? String(err)
+  }
+  if (aborted) { for (const c of buf) yield c; return }
+  let why = null
+  if (failed) why = `the alias reply failed (${String(failed).slice(0, 120)})`
+  else if (toolCall || looksLikeToolCall(text)) why = 'the alias reply is a tool call in disguise'
+  else if (!text.trim()) why = 'the alias reply is empty'
+  if (!why) { for (const c of buf) yield c; return }
+  stats.fallbacks++
+  log(`keep-tools reply fell back to the cold path: ${why} (fallbacks so far: ${stats.fallbacks} of ${stats.keepCalls})`)
+  for await (const c of fallback()) yield c
 }
 
 /** How many tool results in `messages` exceed `max` characters. */
@@ -156,6 +228,7 @@ export function trimToolResults (messages, max) {
 export function apply (ctx, config = {}) {
   const quiet = config.quiet === true
   const reroute = config.reroute && typeof config.reroute === 'object' ? config.reroute : {}
+  const keepToolsVia = config.keepToolsVia && typeof config.keepToolsVia === 'object' ? config.keepToolsVia : {}
   // 2000 is Yunado's tested default (#3465); it is not the default HERE,
   // because a config that trims by default would change what summaries are
   // built from without anyone choosing it.
@@ -185,19 +258,42 @@ export function apply (ctx, config = {}) {
   }
   const log = (msg) => { if (!quiet) console.error(`[llm-compaction-shim] ${msg}`) }
   ctx.on('llm/stream', function (options, next) {
-    const v = classify(options, reroute, maxChars)
+    const v = classify(options, reroute, maxChars, keepToolsVia)
     if (v.action === 'pass') return next()
+    if (v.action === 'keep') {
+      // The fallback needs a runtime handle; without one the certain path is the only path.
+      if (typeof this?.stream !== 'function') {
+        log(`compaction call on ${options.provider}/${options.model}: no runtime handle for a fallback; taking the cold path`)
+      } else {
+        stats.keepCalls++
+        log(`compaction call on ${options.provider}/${options.model}: keeping ${options.tools.length} tool schemas, sending to alias ${v.via} (prefix cache kept; maxTokens ${options.maxTokens})`)
+        const runtime = this
+        const original = { ...options }
+        const cold = () => {
+          const { tools: _dropped, ...rest } = original
+          if (maxChars > 0) rest.messages = trimToolResults(rest.messages, maxChars)
+          log(`compaction call on ${options.provider}/${options.model}: cold path -- dropping ${original.tools.length} tool schemas` +
+              (maxChars > 0 ? `, capping oversized tool results at ${maxChars} chars` : ''))
+          return runtime.stream(rest)
+        }
+        let inner
+        if (Object.isFrozen(options)) inner = runtime.stream({ ...options, model: v.via })
+        else { options.model = v.via; inner = next() }
+        return guardedSummary(inner, cold, log)
+      }
+    }
+    const w = v.action === 'keep' ? classify(options, reroute, maxChars, {}) : v
     const parts = []
-    if (v.dropTools) parts.push(`dropping ${options.tools.length} tool schemas so the summarizer answers in text`)
-    if (v.model) parts.push(`rerouting to ${options.provider}/${v.model} (no reasoning in the summary budget)`)
-    if (v.trim) parts.push(`capping ${countOversized(options.messages, maxChars)} tool result(s) at ${maxChars} chars`)
+    if (w.dropTools) parts.push(`dropping ${options.tools.length} tool schemas so the summarizer answers in text`)
+    if (w.model) parts.push(`rerouting to ${options.provider}/${w.model} (no reasoning in the summary budget)`)
+    if (w.trim) parts.push(`capping ${countOversized(options.messages, maxChars)} tool result(s) at ${maxChars} chars`)
     log(`compaction call on ${options.provider}/${options.model}: ${parts.join('; ')} (maxTokens ${options.maxTokens})`)
-    if (v.action === 'mutate') {
+    if (w.action === 'mutate') {
       // The waterfall's inner callback closes over this same object, so the
       // adapter sees the change; a replacement object would not reach it.
-      if (v.dropTools) delete options.tools
-      if (v.model) options.model = v.model
-      if (v.trim) options.messages = trimToolResults(options.messages, maxChars)
+      if (w.dropTools) delete options.tools
+      if (w.model) options.model = w.model
+      if (w.trim) options.messages = trimToolResults(options.messages, maxChars)
       return next()
     }
     // Frozen options: re-enter the waterfall with a copy. `this` is the llm
@@ -205,8 +301,8 @@ export function apply (ctx, config = {}) {
     // model, so this listener passes it straight through on the second dispatch.
     if (typeof this?.stream === 'function') {
       const { tools: _dropped, ...rest } = options
-      if (v.model) rest.model = v.model
-      if (v.trim) rest.messages = trimToolResults(rest.messages, maxChars)
+      if (w.model) rest.model = w.model
+      if (w.trim) rest.messages = trimToolResults(rest.messages, maxChars)
       return this.stream(rest)
     }
     log('options are frozen and no runtime handle is bound; passing through unchanged')

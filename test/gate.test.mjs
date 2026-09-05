@@ -110,25 +110,105 @@ let n3 = 0; L3["llm/stream"].call({}, call, () => { n3++ })
 check(n3 === 1 && call.messages[1].content.length < 2200 && call.messages[2].content.length === 6000,
       "listener: trims in place, leaves assistant text alone")
 
-
-// --- config hazards ---------------------------------------------------------
-// Two shapes a user can write in cordis.patch.yml that fail SILENTLY.
+// --- config hazards, added 2026-09-03 ---------------------------------------
+// Both of these are shapes a person can write in cordis.patch.yml that fail
+// SILENTLY: a YAML-quoted number, and a reroute map that points back at itself.
 {
-  const errs = []; const realErr = console.error
+  const errs = []
+  const realErr = console.error
   console.error = (m) => errs.push(String(m))
-  apply({ on () {} }, { toolResultMaxChars: '2000', quiet: true })
+  const ctx = { on () {} }
+  apply(ctx, { toolResultMaxChars: '2000', quiet: true })
   console.error = realErr
   check(errs.some((e) => e.includes('not a number') && e.includes('trim is OFF')),
-        'a YAML-quoted toolResultMaxChars says so instead of disabling the trim quietly')
+        'a quoted toolResultMaxChars says so out loud instead of disabling the trim quietly')
+  check(errs.some((e) => e.includes('you probably meant 2000')),
+        'and names the value that was meant')
 }
 {
-  const errs = []; const realErr = console.error
+  const errs = []
+  const realErr = console.error
   console.error = (m) => errs.push(String(m))
-  const cycle = { 'p/a': 'b', 'p/b': 'a' }
+  const cycle = { 'alder/a': 'b', 'alder/b': 'a' }
   apply({ on () {} }, { reroute: cycle, quiet: true })
   console.error = realErr
-  check(errs.some((e) => e.includes('reroute cycle')), 'a reroute cycle is reported, not recursed into')
-  check(Object.keys(cycle).length === 1, 'and one leg is dropped so the survivor still works')
+  check(errs.some((e) => e.includes('reroute cycle')),
+        'a reroute cycle is reported, not recursed into')
+  check(Object.keys(cycle).length === 1,
+        'and one leg is dropped so the surviving reroute still works')
 }
 
+
+// --- keep the cache prefix via a tool_choice-none alias (2026-09-05) ----------
+import { guardedSummary, looksLikeToolCall, stats } from '../index.js'
+{
+  const KV = { 'alder/qwen3.8-27b-vl': 'qwen3.8-27b-vl-compact-notools' }
+  const k = classify({ purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b-vl', tools }, {}, 2000, KV)
+  check(k.action === 'keep' && k.via === 'qwen3.8-27b-vl-compact-notools', 'keep: a compaction call on a lane with an alias keeps its tools and goes to the alias')
+  check(classify({ purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b-vl' }, {}, 2000, KV).action === 'pass' ||
+        classify({ purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b-vl' }, {}, 2000, KV).action !== 'keep', 'keep: a call with no tools is not sent to the alias')
+  check(classify({ purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b', tools }, RR, 2000, KV).action !== 'keep', 'keep: a rerouted (thinking-lane) call takes the cold path, not the alias')
+  check(classify({ purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b-vl-compact-notools', tools }, {}, 0, { 'alder/qwen3.8-27b-vl-compact-notools': 'qwen3.8-27b-vl-compact-notools' }).action !== 'keep', 'keep: an alias mapped to itself is not a loop')
+  check(classify({ provider: 'alder', model: 'qwen3.8-27b-vl', tools }, {}, 0, KV).action === 'pass', 'keep: never touches a main-loop call')
+  check(looksLikeToolCall('<tool_call> <function=get_weather> <parameter=city> Paris') && looksLikeToolCall('  {"name": "bash", "arguments": {}}') && !looksLikeToolCall('## Primary Request and Intent\n- build the marble run'),
+        'looksLikeToolCall: the text form of a tool call is recognised, a summary is not')
+
+  // the guarded stream: a good summary is replayed verbatim
+  const summary = [{ type: 'block-start', index: 0 }, { type: 'text-delta', index: 0, text: '## Summary\n- ok' }, { type: 'block-end', index: 0, block: { type: 'text', text: '## Summary\n- ok' } }, { type: 'finish', reason: { kind: 'stop' } }]
+  async function * from (arr) { for (const c of arr) yield c }
+  const collect = async (it) => { const out = []; for await (const c of it) out.push(c); return out }
+  let fallbackCalls = 0
+  const fb = () => { fallbackCalls++; return from([{ type: 'text-delta', index: 0, text: 'COLD SUMMARY' }, { type: 'finish', reason: { kind: 'stop' } }]) }
+  let out = await collect(guardedSummary(from(summary), fb))
+  check(out.length === 4 && out[1].text === '## Summary\n- ok' && fallbackCalls === 0, 'guarded: a real summary is replayed chunk for chunk, no fallback')
+  // a tool call as text falls back
+  const disguised = [{ type: 'text-delta', index: 0, text: '<tool_call> <function=bash> <parameter=command> ls' }, { type: 'finish', reason: { kind: 'stop' } }]
+  const before = stats.fallbacks
+  out = await collect(guardedSummary(from(disguised), fb))
+  check(fallbackCalls === 1 && out.some(c => c.text === 'COLD SUMMARY') && !out.some(c => (c.text || '').includes('<tool_call>')) && stats.fallbacks === before + 1,
+        'guarded: a tool call in disguise is replaced by the cold path and counted')
+  // a real tool-call chunk falls back too
+  out = await collect(guardedSummary(from([{ type: 'tool-call-delta', index: 0, id: 'x', name: 'bash', argumentsDelta: '{}' }, { type: 'finish', reason: { kind: 'stop' } }]), fb))
+  check(fallbackCalls === 2 && out.some(c => c.text === 'COLD SUMMARY'), 'guarded: a structured tool-call chunk falls back')
+  // an errored reply (e.g. context overflow on the alias) falls back
+  out = await collect(guardedSummary(from([{ type: 'finish', reason: { kind: 'error', failure: { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'too long' } } }]), fb))
+  check(fallbackCalls === 3 && out.some(c => c.text === 'COLD SUMMARY'), 'guarded: an error finish (overflow) falls back -- the fit check by effect')
+  // a throwing inner stream falls back
+  async function * boom () { yield { type: 'text-delta', index: 0, text: 'x' }; throw new Error('socket closed') }
+  out = await collect(guardedSummary(boom(), fb))
+  check(fallbackCalls === 4 && out.some(c => c.text === 'COLD SUMMARY'), 'guarded: a stream that throws mid-way falls back')
+  // an empty reply falls back
+  out = await collect(guardedSummary(from([{ type: 'finish', reason: { kind: 'stop' } }]), fb))
+  check(fallbackCalls === 5, 'guarded: an empty reply falls back')
+  // an ABORTED reply is passed through, never retried
+  out = await collect(guardedSummary(from([{ type: 'text-delta', index: 0, text: 'partial' }, { type: 'finish', reason: { kind: 'aborted' } }]), fb))
+  check(fallbackCalls === 5 && out.length === 2, 'guarded: an aborted reply is passed through, not retried')
+
+  // through the listener: model rewritten to the alias, tools KEPT, no trim, fallback rebuilds the cold copy
+  const L4 = {}
+  apply({ on: (n, fn) => { L4[n] = fn } }, { quiet: true, keepToolsVia: KV, toolResultMaxChars: 2000 })
+  const big = { role: 'tool', content: 'x'.repeat(5000) }
+  const call4 = { purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b-vl', tools: [...tools], maxTokens: 8192, messages: [{ role: 'system', content: 'sys' }, big] }
+  let coldSeen = null
+  const runtime = { stream: (o) => { coldSeen = o; return from([{ type: 'text-delta', index: 0, text: 'COLD' }, { type: 'finish', reason: { kind: 'stop' } }]) } }
+  let innerSeen = false
+  const res = L4['llm/stream'].call(runtime, call4, () => { innerSeen = true; return from(disguised) })
+  out = await collect(res)
+  check(innerSeen && call4.model === 'qwen3.8-27b-vl-compact-notools' && call4.tools.length === 2 && call4.messages[1].content.length === 5000,
+        'listener keep: model rewritten to the alias in place, tools kept, tool results NOT trimmed')
+  check(coldSeen && coldSeen.model === 'qwen3.8-27b-vl' && !('tools' in coldSeen) && coldSeen.messages[1].content.length < 2200 && out.some(c => c.text === 'COLD'),
+        'listener fallback: the cold copy carries the ORIGINAL model, no tools, trimmed results')
+  // frozen options on the keep path re-dispatch a copy to the alias
+  const f4 = Object.freeze({ purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b-vl', tools: [...tools], maxTokens: 8192, messages: [] })
+  let dispatched = []
+  const rt2 = { stream: (o) => { dispatched.push(o); return from(summary) } }
+  out = await collect(L4['llm/stream'].call(rt2, f4, () => { throw new Error('must not call next() on a frozen keep') }))
+  check(dispatched.length === 1 && dispatched[0].model === 'qwen3.8-27b-vl-compact-notools' && dispatched[0].tools.length === 2 && out.length === 4,
+        'listener keep (frozen): a copy goes to the alias with its tools, and a good summary is replayed')
+  // no runtime handle: the keep path is declined and the certain cold path runs
+  const call5 = { purpose: 'compaction', provider: 'alder', model: 'qwen3.8-27b-vl', tools: [...tools], maxTokens: 8192, messages: [] }
+  let n5 = 0
+  L4['llm/stream'].call({}, call5, () => { n5++; return 'inner' })
+  check(n5 === 1 && !('tools' in call5) && call5.model === 'qwen3.8-27b-vl', 'listener keep without a runtime handle: tools dropped, model unchanged (the certain path)')
+}
 console.log(failed ? `${failed} FAILED` : 'ALL PASSED'); process.exit(failed ? 1 : 0)

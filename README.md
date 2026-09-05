@@ -97,8 +97,39 @@ config:
   reroute:
     'provider/thinking-model': 'nothink-model'
 
+  # Keep the KV-cache prefix (0.2.0). Dropping the schemas makes every
+  # summarization a cold prefill, because the schemas sit in the system region
+  # of the chat template. If your server keeps the tools in the rendered prompt
+  # under `tool_choice: none` and only skips the grammar (llama.cpp does), and
+  # your router can pin that parameter onto an alias of the SAME process
+  # (llama-swap: `filters.setParamsByID`), map the lane to that alias here and
+  # the summarization call goes there WITH its tools -- a cache hit instead of
+  # a re-prefill. The reply is buffered and inspected: a tool call written as
+  # text (`<tool_call> ...`, which a lane will still produce under a
+  # tool-forcing prompt), an empty reply, or an error falls back to the cold
+  # path above, counted and logged. A rerouted lane never uses this: a lane
+  # swap is cold regardless. Measured on alder: the alias request reused 656
+  # of 660 prompt tokens from the base lane's request.
+  keepToolsVia:
+    'alder/qwen3.8-27b-vl': 'qwen3.8-27b-vl-compact-notools'
+
   quiet: true   # no log line per gated call
 ```
+
+The llama-swap side of `keepToolsVia`, on the lane's own entry:
+
+```yaml
+    aliases:
+      - qwen3.8-27b-vl-compact-notools
+    filters:
+      setParamsByID:
+        qwen3.8-27b-vl-compact-notools:
+          tool_choice: none
+```
+
+Declare the alias as a route in dsh's `settings.yaml` too (the adapter refuses
+an undeclared id), named so nobody picks it for a session: a session on it can
+never call a tool.
 
 ## Scope, and what it does NOT fix
 
