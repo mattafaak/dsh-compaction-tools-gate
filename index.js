@@ -125,6 +125,45 @@ export function classify (options, reroute = {}, toolResultMaxChars = 0, keepToo
   return { action: Object.isFrozen(options) ? 'redispatch' : 'mutate', dropTools, model, trim }
 }
 
+/**
+ * NO TOOL HISTORY ON A TOOLLESS CALL (2026-09-26). Deleting `options.tools` is not
+ * enough: pi-ai's openai-completions adapter re-adds `params.tools = []` whenever the
+ * history holds tool calls ("Anthropic (via LiteLLM/proxy) requires tools param ..."),
+ * and vLLM rejects that with 400 "`tools` must not be an empty array". Every
+ * compaction on a vLLM lane (Spark lanes 1 and 3) failed -- 36/36 in the specfloor
+ * job on lane 3 -- while llama.cpp on alder accepted it. The adapter's onPayload
+ * hook cannot be used: the runtime installs its own (measured: e2e stayed red).
+ * So the cold-path summary call gets its tool calls and results as plain TEXT: the
+ * summarizer sees the same names, arguments and outputs, and the adapter sees no
+ * tool history, so it sends no `tools` key at all.
+ */
+export function flattenToolHistory (messages) {
+  if (!Array.isArray(messages)) return messages
+  const asText = (content) => {
+    if (typeof content === 'string') return content
+    if (!Array.isArray(content)) return ''
+    return content.map((b) => (typeof b === 'string' ? b : (b && typeof b.text === 'string' ? b.text : ''))).join('')
+  }
+  const block = (b) => {
+    if (b && b.type === 'tool-call') {
+      const args = typeof b.arguments === 'string' ? b.arguments : JSON.stringify(b.arguments ?? {})
+      return { type: 'text', text: `[tool call ${b.name}(${args})]` }
+    }
+    if (b && b.type === 'tool-result') {
+      return { type: 'text', text: `[tool result${b.isError ? ' (error)' : ''}]\n${asText(b.content)}` }
+    }
+    return b
+  }
+  return messages.map((m) => {
+    if (!m || typeof m !== 'object') return m
+    if (m.role === 'tool') return { role: 'user', content: [{ type: 'text', text: `[tool result]\n${asText(m.content)}` }] }
+    if (Array.isArray(m.content) && m.content.some(b => b && (b.type === 'tool-call' || b.type === 'tool-result'))) {
+      return { ...m, content: m.content.map(block) }
+    }
+    return m
+  })
+}
+
 /** Text that is a tool call in disguise: what a lane writes under tool_choice none when it wanted to call. */
 export function looksLikeToolCall (text) {
   const head = (text || '').trimStart().slice(0, 400)
@@ -272,6 +311,9 @@ export function apply (ctx, config = {}) {
         const cold = () => {
           const { tools: _dropped, ...rest } = original
           if (maxChars > 0) rest.messages = trimToolResults(rest.messages, maxChars)
+          // THE THIRD TOOLLESS PATH (2026-09-26): the keep-tools fallback also drops the
+          // tools, so it needs the same flattening or vLLM rejects its `tools: []`.
+          rest.messages = flattenToolHistory(rest.messages)
           log(`compaction call on ${options.provider}/${options.model}: cold path -- dropping ${original.tools.length} tool schemas` +
               (maxChars > 0 ? `, capping oversized tool results at ${maxChars} chars` : ''))
           return runtime.stream(rest)
@@ -291,7 +333,7 @@ export function apply (ctx, config = {}) {
     if (w.action === 'mutate') {
       // The waterfall's inner callback closes over this same object, so the
       // adapter sees the change; a replacement object would not reach it.
-      if (w.dropTools) delete options.tools
+      if (w.dropTools) { delete options.tools; options.messages = flattenToolHistory(options.messages) }
       if (w.model) options.model = w.model
       if (w.trim) options.messages = trimToolResults(options.messages, maxChars)
       return next()
@@ -301,6 +343,7 @@ export function apply (ctx, config = {}) {
     // model, so this listener passes it straight through on the second dispatch.
     if (typeof this?.stream === 'function') {
       const { tools: _dropped, ...rest } = options
+      if (w.dropTools) rest.messages = flattenToolHistory(rest.messages)
       if (w.model) rest.model = w.model
       if (w.trim) rest.messages = trimToolResults(rest.messages, maxChars)
       return this.stream(rest)
