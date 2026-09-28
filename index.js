@@ -77,6 +77,17 @@
  * cold path (tools dropped, results trimmed), counted and logged. The
  * thinking lane's reroute keeps the cold path: a lane swap is cold anyway.
  *
+ * FIFTH JOB (2026-09-28): the SESSION TITLE call on a thinking lane goes to
+ * that lane's thinking-off alias -- see `titleTarget()` and `titleReroute`.
+ * dsh-session-title-llm sends 64 max tokens and keeps text blocks only; on
+ * spark/qwen3.8-flash-next all 64 went to reasoning (finish=length, content
+ * null), so 0 of 115 sessions on that lane ever got a model title. The alias
+ * is the SAME process with enable_thinking false (Spark llama-swap
+ * setParamsByID), so nothing is loaded or evicted. Keyed per lane, like
+ * `reroute`, and deliberately NOT the plugin's own provider/model override:
+ * that override is global, so a session on another lane of the Spark's
+ * exclusive group would have its lane evicted by its own title call.
+ *
  * NO DEPENDENCIES, loaded by absolute file:// URL from a cordis.patch.yml
  * row, for the same reason as dsh-web-search-searxng: nothing here may
  * require a pnpm install, because any pnpm run restores the web-auth prompt.
@@ -123,6 +134,19 @@ export function classify (options, reroute = {}, toolResultMaxChars = 0, keepToo
   const trim = toolResultMaxChars > 0 && countOversized(options.messages, toolResultMaxChars) > 0
   if (!dropTools && model === undefined && !trim) return { action: 'pass' }
   return { action: Object.isFrozen(options) ? 'redispatch' : 'mutate', dropTools, model, trim }
+}
+
+/** The purpose tag dsh-session-title-llm stamps on its title call. */
+export const TITLE_PURPOSE = 'session-title'
+
+/**
+ * The alias a title call on this lane goes to, or undefined (pass).
+ * @param titleReroute - `{ "provider/model": "model" }`, same provider.
+ */
+export function titleTarget (options, titleReroute = {}) {
+  if (!options || options.purpose !== TITLE_PURPOSE) return undefined
+  const t = titleReroute[`${options.provider}/${options.model}`]
+  return typeof t === 'string' && t.length > 0 && t !== options.model ? t : undefined
 }
 
 /**
@@ -268,6 +292,7 @@ export function apply (ctx, config = {}) {
   const quiet = config.quiet === true
   const reroute = config.reroute && typeof config.reroute === 'object' ? config.reroute : {}
   const keepToolsVia = config.keepToolsVia && typeof config.keepToolsVia === 'object' ? config.keepToolsVia : {}
+  const titleReroute = config.titleReroute && typeof config.titleReroute === 'object' ? config.titleReroute : {}
   // 2000 is Yunado's tested default (#3465); it is not the default HERE,
   // because a config that trims by default would change what summaries are
   // built from without anyone choosing it.
@@ -297,6 +322,16 @@ export function apply (ctx, config = {}) {
   }
   const log = (msg) => { if (!quiet) console.error(`[llm-compaction-shim] ${msg}`) }
   ctx.on('llm/stream', function (options, next) {
+    const tt = titleTarget(options, titleReroute)
+    if (tt !== undefined) {
+      log(`title call on ${options.provider}/${options.model}: sending to ${options.provider}/${tt} (thinking off, same process; maxTokens ${options.maxTokens})`)
+      // The title plugin deep-freezes its options: re-enter with a copy (the
+      // alias has no titleReroute key, so the second dispatch passes).
+      if (!Object.isFrozen(options)) { options.model = tt; return next() }
+      if (typeof this?.stream === 'function') return this.stream({ ...options, model: tt })
+      log('title options are frozen and no runtime handle is bound; passing through unchanged')
+      return next()
+    }
     const v = classify(options, reroute, maxChars, keepToolsVia)
     if (v.action === 'pass') return next()
     if (v.action === 'keep') {

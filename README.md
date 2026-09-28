@@ -113,6 +113,15 @@ config:
   keepToolsVia:
     'alder/qwen3.8-27b-vl': 'qwen3.8-27b-vl-compact-notools'
 
+  # Session titles on a thinking lane (0.3.0). dsh's title plugin asks for 64
+  # tokens and keeps text only; a thinking lane spends all 64 reasoning, so no
+  # model title ever lands. Map the lane to its thinking-off alias of the SAME
+  # process and the title call (purpose `session-title`) goes there. Per lane,
+  # on purpose: the title plugin's own provider/model override is global and
+  # would send every session's title to one route.
+  titleReroute:
+    'provider/thinking-model': 'thinking-off-alias'
+
   quiet: true   # no log line per gated call
 ```
 
