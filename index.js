@@ -88,6 +88,15 @@
  * that override is global, so a session on another lane of the Spark's
  * exclusive group would have its lane evicted by its own title call.
  *
+ * SIXTH JOB (2026-09-29): raise a lane's SUMMARY CAP -- see `summaryMaxTokens`.
+ * dsh-compaction-basic asks for 8,192 tokens and fails the compaction on a
+ * max-tokens finish ("summarization truncated at the token cap"); it checks
+ * nothing else about length. Each summary carries the previous one forward,
+ * so over a long session it grows: racr 09-28/29 went 4,208 -> 8,051 output
+ * tokens over 12 successful compactions, thinking off, and 13 attempts
+ * truncated (one burst of 8 in a row, ~3.5 min each). On 0.1.6 the cap is a
+ * preset-owned row, so this seam is the only one that reaches it. Per lane.
+ *
  * NO DEPENDENCIES, loaded by absolute file:// URL from a cordis.patch.yml
  * row, for the same reason as dsh-web-search-searxng: nothing here may
  * require a pnpm install, because any pnpm run restores the web-auth prompt.
@@ -120,8 +129,10 @@ export const COMPACTION_PURPOSE = 'compaction'
  * @returns `{ action: 'pass'|'mutate'|'redispatch', dropTools, model }`;
  *   pure, so the test can pin it.
  */
-export function classify (options, reroute = {}, toolResultMaxChars = 0, keepToolsVia = {}) {
+export function classify (options, reroute = {}, toolResultMaxChars = 0, keepToolsVia = {}, summaryMaxTokens = {}) {
   if (!options || options.purpose !== COMPACTION_PURPOSE) return { action: 'pass' }
+  const cap = summaryMaxTokens[`${options.provider}/${options.model}`]
+  const maxTokens = Number.isInteger(cap) && cap > (options.maxTokens ?? 0) ? cap : undefined
   const dropTools = Array.isArray(options.tools) && options.tools.length > 0
   const target = reroute[`${options.provider}/${options.model}`]
   const model = typeof target === 'string' && target.length > 0 && target !== options.model ? target : undefined
@@ -129,11 +140,11 @@ export function classify (options, reroute = {}, toolResultMaxChars = 0, keepToo
   // it is not being rerouted to another process (that is cold regardless).
   const via = keepToolsVia[`${options.provider}/${options.model}`]
   if (dropTools && model === undefined && typeof via === 'string' && via.length > 0 && via !== options.model) {
-    return { action: 'keep', via }
+    return { action: 'keep', via, maxTokens }
   }
   const trim = toolResultMaxChars > 0 && countOversized(options.messages, toolResultMaxChars) > 0
-  if (!dropTools && model === undefined && !trim) return { action: 'pass' }
-  return { action: Object.isFrozen(options) ? 'redispatch' : 'mutate', dropTools, model, trim }
+  if (!dropTools && model === undefined && !trim && maxTokens === undefined) return { action: 'pass' }
+  return { action: Object.isFrozen(options) ? 'redispatch' : 'mutate', dropTools, model, trim, maxTokens }
 }
 
 /** The purpose tag dsh-session-title-llm stamps on its title call. */
@@ -293,6 +304,12 @@ export function apply (ctx, config = {}) {
   const reroute = config.reroute && typeof config.reroute === 'object' ? config.reroute : {}
   const keepToolsVia = config.keepToolsVia && typeof config.keepToolsVia === 'object' ? config.keepToolsVia : {}
   const titleReroute = config.titleReroute && typeof config.titleReroute === 'object' ? config.titleReroute : {}
+  // A YAML-quoted number is a string and would silently do nothing: say so, drop it.
+  const summaryMaxTokens = {}
+  for (const [lane, v] of Object.entries(config.summaryMaxTokens && typeof config.summaryMaxTokens === 'object' ? config.summaryMaxTokens : {})) {
+    if (Number.isInteger(v) && v > 0) summaryMaxTokens[lane] = v
+    else console.error(`[llm-compaction-shim] summaryMaxTokens.${lane} is ${JSON.stringify(v)}, not a positive integer -- ignored`)
+  }
   // 2000 is Yunado's tested default (#3465); it is not the default HERE,
   // because a config that trims by default would change what summaries are
   // built from without anyone choosing it.
@@ -332,7 +349,7 @@ export function apply (ctx, config = {}) {
       log('title options are frozen and no runtime handle is bound; passing through unchanged')
       return next()
     }
-    const v = classify(options, reroute, maxChars, keepToolsVia)
+    const v = classify(options, reroute, maxChars, keepToolsVia, summaryMaxTokens)
     if (v.action === 'pass') return next()
     if (v.action === 'keep') {
       // The fallback needs a runtime handle; without one the certain path is the only path.
@@ -340,9 +357,9 @@ export function apply (ctx, config = {}) {
         log(`compaction call on ${options.provider}/${options.model}: no runtime handle for a fallback; taking the cold path`)
       } else {
         stats.keepCalls++
-        log(`compaction call on ${options.provider}/${options.model}: keeping ${options.tools.length} tool schemas, sending to alias ${v.via} (prefix cache kept; maxTokens ${options.maxTokens})`)
+        log(`compaction call on ${options.provider}/${options.model}: keeping ${options.tools.length} tool schemas, sending to alias ${v.via} (prefix cache kept; maxTokens ${v.maxTokens ?? options.maxTokens})`)
         const runtime = this
-        const original = { ...options }
+        const original = { ...options, ...(v.maxTokens ? { maxTokens: v.maxTokens } : {}) }
         const cold = () => {
           const { tools: _dropped, ...rest } = original
           if (maxChars > 0) rest.messages = trimToolResults(rest.messages, maxChars)
@@ -354,23 +371,25 @@ export function apply (ctx, config = {}) {
           return runtime.stream(rest)
         }
         let inner
-        if (Object.isFrozen(options)) inner = runtime.stream({ ...options, model: v.via })
-        else { options.model = v.via; inner = next() }
+        if (Object.isFrozen(options)) inner = runtime.stream({ ...options, model: v.via, ...(v.maxTokens ? { maxTokens: v.maxTokens } : {}) })
+        else { options.model = v.via; if (v.maxTokens) options.maxTokens = v.maxTokens; inner = next() }
         return guardedSummary(inner, cold, log)
       }
     }
-    const w = v.action === 'keep' ? classify(options, reroute, maxChars, {}) : v
+    const w = v.action === 'keep' ? classify(options, reroute, maxChars, {}, summaryMaxTokens) : v
     const parts = []
     if (w.dropTools) parts.push(`dropping ${options.tools.length} tool schemas so the summarizer answers in text`)
     if (w.model) parts.push(`rerouting to ${options.provider}/${w.model} (no reasoning in the summary budget)`)
     if (w.trim) parts.push(`capping ${countOversized(options.messages, maxChars)} tool result(s) at ${maxChars} chars`)
-    log(`compaction call on ${options.provider}/${options.model}: ${parts.join('; ')} (maxTokens ${options.maxTokens})`)
+    if (w.maxTokens) parts.push(`raising the summary cap ${options.maxTokens} -> ${w.maxTokens}`)
+    log(`compaction call on ${options.provider}/${options.model}: ${parts.join('; ')} (maxTokens ${w.maxTokens ?? options.maxTokens})`)
     if (w.action === 'mutate') {
       // The waterfall's inner callback closes over this same object, so the
       // adapter sees the change; a replacement object would not reach it.
       if (w.dropTools) { delete options.tools; options.messages = flattenToolHistory(options.messages) }
       if (w.model) options.model = w.model
       if (w.trim) options.messages = trimToolResults(options.messages, maxChars)
+      if (w.maxTokens) options.maxTokens = w.maxTokens
       return next()
     }
     // Frozen options: re-enter the waterfall with a copy. `this` is the llm
@@ -381,6 +400,7 @@ export function apply (ctx, config = {}) {
       if (w.dropTools) rest.messages = flattenToolHistory(rest.messages)
       if (w.model) rest.model = w.model
       if (w.trim) rest.messages = trimToolResults(rest.messages, maxChars)
+      if (w.maxTokens) rest.maxTokens = w.maxTokens
       return this.stream(rest)
     }
     log('options are frozen and no runtime handle is bound; passing through unchanged')

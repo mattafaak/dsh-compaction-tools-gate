@@ -122,6 +122,13 @@ config:
   titleReroute:
     'provider/thinking-model': 'thinking-off-alias'
 
+  # Raise a lane's summary cap (0.4.0). Each summary carries the previous one
+  # forward, so over a long session it outgrows a fixed budget; the compaction
+  # then fails "truncated at the token cap" and retries at every step. Per lane;
+  # never lowers a larger request.
+  summaryMaxTokens:
+    'provider/model': 16384
+
   quiet: true   # no log line per gated call
 ```
 
