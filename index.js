@@ -299,6 +299,33 @@ export function trimToolResults (messages, max) {
     : m))
 }
 
+/** The omission marker trimToolResults writes; counting it is counting real cuts. */
+const OMITTED = /characters of this tool result were omitted before summarization/g
+
+function markers (messages) {
+  try { return (JSON.stringify(messages).match(OMITTED) || []).length } catch { return 0 }
+}
+
+/**
+ * A cold path's messages: oversized tool results capped FIRST, then -- when the
+ * tools are dropped -- the tool history flattened to text. THE ORDER IS THE FIX
+ * (2026-09-29): flattening turns every tool result into a plain text block and
+ * the trim only recognises tool results, so trim-after-flatten cut nothing on the
+ * mutate and redispatch paths since 09-26, while the log (counted on the input)
+ * said "capping N tool result(s)". Returns { messages, cut }, cut = markers added.
+ */
+export function coldMessages (messages, maxChars, flatten) {
+  let out = messages
+  let cut = 0
+  if (maxChars > 0) {
+    const before = markers(out)
+    out = trimToolResults(out, maxChars)
+    cut = markers(out) - before
+  }
+  if (flatten) out = flattenToolHistory(out)
+  return { messages: out, cut }
+}
+
 export function apply (ctx, config = {}) {
   const quiet = config.quiet === true
   const reroute = config.reroute && typeof config.reroute === 'object' ? config.reroute : {}
@@ -362,12 +389,12 @@ export function apply (ctx, config = {}) {
         const original = { ...options, ...(v.maxTokens ? { maxTokens: v.maxTokens } : {}) }
         const cold = () => {
           const { tools: _dropped, ...rest } = original
-          if (maxChars > 0) rest.messages = trimToolResults(rest.messages, maxChars)
           // THE THIRD TOOLLESS PATH (2026-09-26): the keep-tools fallback also drops the
           // tools, so it needs the same flattening or vLLM rejects its `tools: []`.
-          rest.messages = flattenToolHistory(rest.messages)
+          const c = coldMessages(rest.messages, maxChars, true)
+          rest.messages = c.messages
           log(`compaction call on ${options.provider}/${options.model}: cold path -- dropping ${original.tools.length} tool schemas` +
-              (maxChars > 0 ? `, capping oversized tool results at ${maxChars} chars` : ''))
+              (maxChars > 0 ? `, capped ${c.cut} tool result(s) at ${maxChars} chars` : ''))
           return runtime.stream(rest)
         }
         let inner
@@ -377,18 +404,19 @@ export function apply (ctx, config = {}) {
       }
     }
     const w = v.action === 'keep' ? classify(options, reroute, maxChars, {}, summaryMaxTokens) : v
+    const c = (w.trim || w.dropTools) ? coldMessages(options.messages, w.trim ? maxChars : 0, !!w.dropTools) : null
     const parts = []
     if (w.dropTools) parts.push(`dropping ${options.tools.length} tool schemas so the summarizer answers in text`)
     if (w.model) parts.push(`rerouting to ${options.provider}/${w.model} (no reasoning in the summary budget)`)
-    if (w.trim) parts.push(`capping ${countOversized(options.messages, maxChars)} tool result(s) at ${maxChars} chars`)
+    if (w.trim) parts.push(`capped ${c.cut} tool result(s) at ${maxChars} chars`)
     if (w.maxTokens) parts.push(`raising the summary cap ${options.maxTokens} -> ${w.maxTokens}`)
     log(`compaction call on ${options.provider}/${options.model}: ${parts.join('; ')} (maxTokens ${w.maxTokens ?? options.maxTokens})`)
     if (w.action === 'mutate') {
       // The waterfall's inner callback closes over this same object, so the
       // adapter sees the change; a replacement object would not reach it.
-      if (w.dropTools) { delete options.tools; options.messages = flattenToolHistory(options.messages) }
+      if (w.dropTools) delete options.tools
+      if (c) options.messages = c.messages
       if (w.model) options.model = w.model
-      if (w.trim) options.messages = trimToolResults(options.messages, maxChars)
       if (w.maxTokens) options.maxTokens = w.maxTokens
       return next()
     }
@@ -397,9 +425,8 @@ export function apply (ctx, config = {}) {
     // model, so this listener passes it straight through on the second dispatch.
     if (typeof this?.stream === 'function') {
       const { tools: _dropped, ...rest } = options
-      if (w.dropTools) rest.messages = flattenToolHistory(rest.messages)
+      if (c) rest.messages = c.messages
       if (w.model) rest.model = w.model
-      if (w.trim) rest.messages = trimToolResults(rest.messages, maxChars)
       if (w.maxTokens) rest.maxTokens = w.maxTokens
       return this.stream(rest)
     }
